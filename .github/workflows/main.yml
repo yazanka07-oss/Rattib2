@@ -1,0 +1,117 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: 17}
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.5'}
+      - name: Create Android project files
+        run: |
+          mkdir -p app/src/main/java/com/rattib/app app/src/main/assets
+          cat > settings.gradle <<'RATTIB_EOF'
+          pluginManagement{repositories{google();mavenCentral();gradlePluginPortal()}}
+          dependencyResolutionManagement{repositories{google();mavenCentral()}}
+          rootProject.name='Rattib'
+          include ':app'
+          RATTIB_EOF
+          cat > build.gradle <<'RATTIB_EOF'
+          plugins{id 'com.android.application' version '8.2.2' apply false}
+          RATTIB_EOF
+          cat > gradle.properties <<'RATTIB_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          RATTIB_EOF
+          cat > app/build.gradle <<'RATTIB_EOF'
+          plugins{id 'com.android.application'}
+          android{namespace 'com.rattib.app';compileSdk 34
+           defaultConfig{applicationId 'com.rattib.app';minSdk 24;targetSdk 34;versionCode 1;versionName '1.0'}
+           compileOptions{sourceCompatibility JavaVersion.VERSION_1_8;targetCompatibility JavaVersion.VERSION_1_8}}
+          dependencies{implementation 'androidx.webkit:webkit:1.8.0'}
+          RATTIB_EOF
+          cat > app/src/main/AndroidManifest.xml <<'RATTIB_EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+            <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+            <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+            <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+            <application android:label="رتّب" android:supportsRtl="true" android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop" android:windowSoftInputMode="adjustResize">
+                <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+              </activity>
+              <receiver android:name=".Reminders$AlarmReceiver" android:exported="false"/>
+              <receiver android:name=".Reminders$BootReceiver" android:exported="true">
+                <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/><action android:name="android.intent.action.TIMEZONE_CHANGED"/></intent-filter>
+              </receiver>
+            </application>
+          </manifest>
+          RATTIB_EOF
+          cat > app/src/main/java/com/rattib/app/MainActivity.java <<'RATTIB_EOF'
+          package com.rattib.app;
+          import android.Manifest;import android.app.*;import android.content.*;import android.content.pm.PackageManager;import android.net.Uri;import android.os.*;import android.webkit.*;
+          import androidx.webkit.WebViewAssetLoader;
+          public class MainActivity extends Activity {
+            WebView wv; PermissionRequest pendingReq; String pendingOpen;
+            @Override protected void onCreate(Bundle b){super.onCreate(b);Reminders.channel(this);
+              if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},1);
+              wv=new WebView(this);setContentView(wv);WebSettings s=wv.getSettings();s.setJavaScriptEnabled(true);s.setDomStorageEnabled(true);s.setMediaPlaybackRequiresUserGesture(false);
+              final WebViewAssetLoader al=new WebViewAssetLoader.Builder().addPathHandler("/assets/",new WebViewAssetLoader.AssetsPathHandler(this)).build();
+              wv.setWebViewClient(new WebViewClient(){@Override public WebResourceResponse shouldInterceptRequest(WebView v,WebResourceRequest r){return al.shouldInterceptRequest(r.getUrl());}});
+              wv.setWebChromeClient(new WebChromeClient(){@Override public void onPermissionRequest(final PermissionRequest r){runOnUiThread(()->{
+                if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)==PackageManager.PERMISSION_GRANTED)r.grant(r.getResources());else{pendingReq=r;requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},2);}});}});
+              wv.addJavascriptInterface(new Object(){
+                @JavascriptInterface public void sync(String j){Reminders.save(MainActivity.this,j);}
+                @JavascriptInterface public String pending(){String p=pendingOpen;pendingOpen=null;return p==null?"":p;}
+                @JavascriptInterface public void exact(){if(Build.VERSION.SDK_INT>=31&&!getSystemService(AlarmManager.class).canScheduleExactAlarms())startActivity(new Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,Uri.parse("package:"+getPackageName())));}
+              },"RattibAndroid");
+              pendingOpen=getIntent().getStringExtra("open");
+              wv.loadUrl("https://appassets.androidplatform.net/assets/rattib.html");}
+            @Override protected void onNewIntent(Intent i){super.onNewIntent(i);String o=i.getStringExtra("open");if(o!=null)wv.evaluateJavascript("window.openFromNative&&openFromNative("+org.json.JSONObject.quote(o)+")",null);}
+            @Override public void onRequestPermissionsResult(int c,String[] p,int[] g){if(c==2&&pendingReq!=null){if(g.length>0&&g[0]==PackageManager.PERMISSION_GRANTED)pendingReq.grant(pendingReq.getResources());else pendingReq.deny();pendingReq=null;}}
+            @Override public void onBackPressed(){wv.evaluateJavascript("(function(){return S.v=='home'&&!$('#mb').classList.contains('o')})()",v->{if("true".equals(v))finish();else wv.evaluateJavascript("history.back()",null);});}
+          }
+          RATTIB_EOF
+          cat > app/src/main/java/com/rattib/app/Reminders.java <<'RATTIB_EOF'
+          package com.rattib.app;
+          import android.app.*;import android.content.*;import android.os.Build;import org.json.*;
+          public class Reminders {
+            static final String CH="rattib";
+            static void channel(Context c){if(Build.VERSION.SDK_INT>=26){NotificationChannel ch=new NotificationChannel(CH,"تذكيرات رتّب",NotificationManager.IMPORTANCE_HIGH);ch.setDescription("تذكيرات المهام والأنشطة");c.getSystemService(NotificationManager.class).createNotificationChannel(ch);}}
+            static SharedPreferences sp(Context c){return c.getSharedPreferences("rem",0);}
+            static void save(Context c,String j){sp(c).edit().putString("list",j).apply();schedule(c);}
+            static PendingIntent pi(Context c,String id,String t,String x,long at,int f){Intent i=new Intent(c,AlarmReceiver.class).putExtra("id",id).putExtra("title",t).putExtra("text",x).putExtra("at",at);return PendingIntent.getBroadcast(c,id.hashCode(),i,f|PendingIntent.FLAG_IMMUTABLE);}
+            /** يلغي كل التنبيهات القديمة ثم يجدول أول موعد قادم لكل تذكير (نفس requestCode = لا تكرار). */
+            static void schedule(Context c){try{AlarmManager am=c.getSystemService(AlarmManager.class);SharedPreferences p=sp(c);
+              JSONArray old=new JSONArray(p.getString("ids","[]"));
+              for(int k=0;k<old.length();k++){PendingIntent o=pi(c,old.getString(k),"","",0,PendingIntent.FLAG_NO_CREATE);if(o!=null){am.cancel(o);o.cancel();}}
+              JSONArray l=new JSONArray(p.getString("list","[]")),ids=new JSONArray();long now=System.currentTimeMillis();
+              for(int k=0;k<l.length();k++){JSONObject r=l.getJSONObject(k);JSONArray t=r.getJSONArray("times");long at=0;
+                for(int q=0;q<t.length();q++)if(t.getLong(q)>now){at=t.getLong(q);break;}
+                if(at==0)continue;String id=r.getString("id");PendingIntent pi=pi(c,id,r.getString("title"),r.getString("text"),at,PendingIntent.FLAG_UPDATE_CURRENT);
+                if(Build.VERSION.SDK_INT<31||am.canScheduleExactAlarms())am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,at,pi);else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,at,pi);
+                ids.put(id);}
+              p.edit().putString("ids",ids.toString()).apply();}catch(Exception e){}}
+            public static class AlarmReceiver extends BroadcastReceiver{@Override public void onReceive(Context c,Intent i){
+              String id=i.getStringExtra("id"),text=i.getStringExtra("text");channel(c);
+              Intent o=new Intent(c,MainActivity.class).putExtra("open",id).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP|Intent.FLAG_ACTIVITY_CLEAR_TOP);
+              PendingIntent tap=PendingIntent.getActivity(c,id.hashCode(),o,PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+              Notification.Builder b=Build.VERSION.SDK_INT>=26?new Notification.Builder(c,CH):new Notification.Builder(c);
+              b.setSmallIcon(android.R.drawable.ic_popup_reminder).setContentTitle("🌿 "+i.getStringExtra("title")).setContentText(text).setStyle(new Notification.BigTextStyle().bigText(text)).setColor(0xFF48685A).setAutoCancel(true).setContentIntent(tap).setCategory(Notification.CATEGORY_REMINDER);
+              c.getSystemService(NotificationManager.class).notify(id.hashCode(),b.build()); // نفس المعرّف يستبدل القديم
+              long at=i.getLongExtra("at",0);
+              try{JSONArray l=new JSONArray(sp(c).getString("list","[]"));for(int k=0;k<l.length();k++){JSONObject r=l.getJSONObject(k);if(r.getString("id").equals(id)){JSONArray t=r.getJSONArray("times"),n=new JSONArray();for(int q=0;q<t.length();q++)if(t.getLong(q)>at)n.put(t.getLong(q));r.put("times",n);}}sp(c).edit().putString("list",l.toString()).apply();}catch(Exception e){}
+              schedule(c);}}
+            public static class BootReceiver extends BroadcastReceiver{@Override public void onReceive(Context c,Intent i){schedule(c);}}
+          }
+          RATTIB_EOF
+          cp rattib.html app/src/main/assets/rattib.html
+
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with: {name: rattib-apk, path: app/build/outputs/apk/debug/app-debug.apk}
+        
